@@ -1,0 +1,133 @@
+name: Sign iOS IPA from Builder Mobile
+run-name: Sign IPA ${{ inputs.signed_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Build run id that contains the unsigned IPA artifact
+        required: true
+        type: string
+      artifact_name:
+        description: Name of the unsigned IPA artifact
+        required: true
+        type: string
+      signed_name:
+        description: Name for the signed IPA
+        required: true
+        type: string
+      bundle_id:
+        description: Optional bundle identifier override (empty = use the provisioning profile)
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  sign:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download unsigned IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: unsigned
+          run-id: ${{ inputs.run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Sign IPA
+        shell: bash
+        env:
+          P12_BASE64: ${{ secrets.SIGN_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.SIGN_P12_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.SIGN_PROFILE_BASE64 }}
+          SIGNED_NAME: ${{ inputs.signed_name }}
+          NEW_BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$P12_BASE64" || -z "$PROFILE_BASE64" ]]; then
+            echo "Signing secrets are missing. Add a certificate in Builder Mobile first." >&2
+            exit 1
+          fi
+
+          WORK="$RUNNER_TEMP/sign"
+          mkdir -p "$WORK" "$GITHUB_WORKSPACE/signed"
+          echo "$P12_BASE64" | base64 --decode > "$WORK/cert.p12"
+          echo "$PROFILE_BASE64" | base64 --decode > "$WORK/profile.mobileprovision"
+
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$WORK/cert.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
+
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk '/[0-9A-F]{40}/ {print $2; exit}')
+          if [[ -z "$IDENTITY" ]]; then
+            echo "No valid code signing identity was found in the certificate." >&2
+            exit 1
+          fi
+          echo "Using identity: $IDENTITY"
+
+          security cms -D -i "$WORK/profile.mobileprovision" > "$WORK/profile.plist"
+          /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "$WORK/profile.plist" > "$WORK/entitlements.plist"
+          PROFILE_APP_ID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$WORK/profile.plist")
+          PROFILE_BUNDLE_ID="${PROFILE_APP_ID#*.}"
+
+          IPA=$(find unsigned -name '*.ipa' -print -quit)
+          if [[ -z "$IPA" ]]; then
+            echo "No .ipa file found in the downloaded artifact." >&2
+            exit 1
+          fi
+          unzip -q "$IPA" -d "$WORK/ipa"
+          APP=$(find "$WORK/ipa/Payload" -maxdepth 1 -name '*.app' -print -quit)
+
+          if [[ -n "$NEW_BUNDLE_ID" ]]; then
+            FINAL_BUNDLE_ID="$NEW_BUNDLE_ID"
+          elif [[ "$PROFILE_BUNDLE_ID" != "*" ]]; then
+            FINAL_BUNDLE_ID="$PROFILE_BUNDLE_ID"
+          else
+            FINAL_BUNDLE_ID=""
+          fi
+          if [[ -n "$FINAL_BUNDLE_ID" ]]; then
+            echo "Setting bundle identifier to $FINAL_BUNDLE_ID"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $FINAL_BUNDLE_ID" "$APP/Info.plist"
+          fi
+
+          cp "$WORK/profile.mobileprovision" "$APP/embedded.mobileprovision"
+          rm -rf "$APP/_CodeSignature"
+
+          # Sign nested code first (deepest items first), then the app itself.
+          find "$APP" -depth \( -name '*.dylib' -o -name '*.framework' -o -name '*.appex' \) -print0 |
+            while IFS= read -r -d '' ITEM; do
+              codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" --timestamp=none "$ITEM"
+            done
+
+          codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" --timestamp=none \
+            --entitlements "$WORK/entitlements.plist" "$APP"
+          codesign --verify --deep --strict "$APP"
+
+          NAME=$(echo "$SIGNED_NAME" | tr -cd 'A-Za-z0-9._-')
+          (cd "$WORK/ipa" && /usr/bin/zip -qry "$GITHUB_WORKSPACE/signed/$NAME.ipa" Payload)
+          ls -lh "$GITHUB_WORKSPACE/signed/$NAME.ipa"
+
+      - name: Remove temporary keychain
+        if: always()
+        shell: bash
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
+      - name: Upload signed IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-ios-${{ inputs.signed_name }}
+          path: signed/*.ipa
+          if-no-files-found: error
+          retention-days: 14
