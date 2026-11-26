@@ -88,6 +88,15 @@ jobs:
         if: hashFiles(format('{0}/ios/Podfile', inputs.project_path)) != ''
         run: pod install --project-directory="${{ inputs.project_path }}/ios"
 
+      - name: Generate Xcode project with XcodeGen when project.yml exists
+        if: hashFiles(format('{0}/project.yml', inputs.project_path)) != '' && hashFiles(format('{0}/*.xcodeproj/project.pbxproj', inputs.project_path)) == ''
+        working-directory: ${{ inputs.project_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          xcodegen generate
+
       - name: Build Xcode project
         if: hashFiles(format('{0}/pubspec.yaml', inputs.project_path)) == ''
         shell: bash
