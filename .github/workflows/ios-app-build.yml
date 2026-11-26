@@ -1,0 +1,32 @@
+name: Build Builder Mobile App
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ios-app/**'
+      - '.github/workflows/ios-app-build.yml'
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build unsigned iOS app
+        working-directory: ios-app
+        run: |
+          set -euo pipefail
+          xcodebuild -project BuilderMobile.xcodeproj -scheme BuilderMobile -configuration Release -sdk iphoneos -derivedDataPath "$RUNNER_TEMP/DerivedData" CODE_SIGNING_ALLOWED=NO build
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/BuilderMobile.app"
+          test -d "$APP"
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
+          (cd "$RUNNER_TEMP/ipa" && /usr/bin/zip -qry "$GITHUB_WORKSPACE/BuilderMobile-unsigned.ipa" Payload)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BuilderMobile-unsigned-IPA
+          path: BuilderMobile-unsigned.ipa
+          retention-days: 14

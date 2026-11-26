@@ -1,0 +1,635 @@
+name: Free iOS Simulator Preview
+
+run-name: "iPhone Simulator Preview #${{ github.run_number }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_path:
+        description: Project folder relative to repository root
+        required: false
+        default: .
+        type: string
+      scheme:
+        description: Main application target (leave empty to auto-detect)
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-simulator-preview
+  cancel-in-progress: true
+
+jobs:
+  simulator-preview:
+    name: Run app in iPhone Simulator and capture every screen
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # ---------- project-type setup (same detection as the IPA builder) ----------
+
+      - name: Set up Node.js when needed
+        if: hashFiles(format('{0}/package.json', inputs.project_path)) != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install JavaScript dependencies
+        if: hashFiles(format('{0}/package.json', inputs.project_path)) != ''
+        continue-on-error: true
+        working-directory: ${{ inputs.project_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable || true
+          if [[ -f pnpm-lock.yaml ]]; then
+            corepack prepare pnpm@latest --activate
+            pnpm install --frozen-lockfile
+          elif [[ -f yarn.lock ]]; then
+            yarn install --frozen-lockfile
+          elif [[ -f package-lock.json ]]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Set up Flutter when needed
+        if: hashFiles(format('{0}/pubspec.yaml', inputs.project_path)) != ''
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Build Flutter app for simulator
+        if: hashFiles(format('{0}/pubspec.yaml', inputs.project_path)) != ''
+        continue-on-error: true
+        working-directory: ${{ inputs.project_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -d ios ]]; then
+            flutter create --platforms=ios .
+          fi
+          flutter pub get
+          flutter build ios --simulator --debug --no-codesign
+
+      - name: Generate iOS project for managed Expo
+        if: hashFiles(format('{0}/package.json', inputs.project_path)) != '' && hashFiles(format('{0}/ios/*.xcodeproj/project.pbxproj', inputs.project_path)) == '' && hashFiles(format('{0}/pubspec.yaml', inputs.project_path)) == ''
+        continue-on-error: true
+        working-directory: ${{ inputs.project_path }}
+        shell: bash
+        run: |
+          if grep -q '"expo"' package.json; then
+            npx expo prebuild --platform ios --no-install
+          fi
+
+      # ---------- simulator ----------
+
+      - name: Boot iPhone Simulator
+        id: boot
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          xcodebuild -version
+
+          DEVICE_ID=$(xcrun simctl list devices available -j | python3 -c '
+          import json
+          import sys
+
+          data = json.load(sys.stdin)
+
+          devices = [
+              device
+              for group in data["devices"].values()
+              for device in group
+              if device["isAvailable"]
+              and device["name"].startswith("iPhone")
+          ]
+
+          pro = [d for d in devices if d["name"].endswith("Pro")]
+          selected = pro[0] if pro else (devices[0] if devices else None)
+
+          print(selected["udid"] if selected else "")
+          ')
+
+          if [[ -z "$DEVICE_ID" ]]; then
+            echo "::error::No available iPhone simulator"
+            exit 1
+          fi
+
+          echo "device_id=$DEVICE_ID" >> "$GITHUB_OUTPUT"
+
+          xcrun simctl boot "$DEVICE_ID" || true
+          xcrun simctl bootstatus "$DEVICE_ID" -b
+
+          xcrun simctl status_bar "$DEVICE_ID" override \
+            --time "9:41" \
+            --dataNetwork wifi \
+            --wifiMode active \
+            --wifiBars 3 \
+            --cellularMode active \
+            --cellularBars 4 \
+            --batteryState charged \
+            --batteryLevel 100 || true
+
+      # ---------- detect project + inject screenshot tests ----------
+      - name: Build app and prepare screenshot tests
+        id: prep
+        continue-on-error: true
+        shell: bash
+        env:
+          PROJECT_PATH: ${{ inputs.project_path }}
+          APP_TARGET: ${{ inputs.scheme }}
+          DEVICE_ID: ${{ steps.boot.outputs.device_id }}
+        run: |
+          set -euo pipefail
+
+          exec > >(tee "$GITHUB_WORKSPACE/prep.log") 2>&1
+
+          echo "mode=none" >> "$GITHUB_OUTPUT"
+
+          SUPPORT="$GITHUB_WORKSPACE/.github/screenshot-preview"
+          for f in ScreenshotTests.swift HostApp.swift make_runner.rb capture_web.cjs; do
+            if [[ ! -f "$SUPPORT/$f" ]]; then
+              echo "error: missing .github/screenshot-preview/$f - run the preview from the Builder Mobile app so it adds these files to the repository"
+              exit 1
+            fi
+          done
+
+          if [[ -z "${PROJECT_PATH// }" ]]; then PROJECT_PATH="."; fi
+          ROOT="$GITHUB_WORKSPACE/$PROJECT_PATH"
+
+          if [[ ! -d "$ROOT" ]]; then
+            echo "::error::Project directory not found: $PROJECT_PATH"
+            exit 1
+          fi
+
+          find_project() {
+            find "$1" -maxdepth 5 -name '*.xcodeproj' \
+              -not -path '*/Pods/*' \
+              -not -path '*/node_modules/*' \
+              -not -path '*/.build/*' \
+              -not -path '*/build/*' \
+              -not -path '*/DerivedData/*' \
+              -print 2>/dev/null | sort | head -1 || true
+          }
+
+          SEARCH="$ROOT"
+          if [[ -d "$ROOT/ios" ]]; then SEARCH="$ROOT/ios"; fi
+          if [[ -d "$ROOT/iosApp" && "$PROJECT_PATH" == "." ]]; then SEARCH="$ROOT/iosApp"; fi
+
+          APP_PROJECT=$(find_project "$SEARCH")
+
+          # XcodeGen projects have no .xcodeproj until generated
+          if [[ -z "$APP_PROJECT" ]]; then
+            YML=$(find "$ROOT" -maxdepth 3 -name 'project.yml' \
+              -not -path '*/node_modules/*' -print 2>/dev/null | head -1 || true)
+            if [[ -n "$YML" ]]; then
+              echo "XcodeGen spec found: $YML"
+              brew install xcodegen
+              (cd "$(dirname "$YML")" && xcodegen generate)
+              APP_PROJECT=$(find_project "$ROOT")
+            fi
+          fi
+
+          if [[ -z "$APP_PROJECT" ]]; then
+            APP_PROJECT=$(find_project "$ROOT")
+          fi
+
+          # ----- no Xcode project: try a web project -----
+          if [[ -z "$APP_PROJECT" ]]; then
+            echo "No Xcode project found. Looking for a web project..."
+
+            WEBROOT=""
+
+            if [[ -f "$ROOT/index.html" ]]; then
+              WEBROOT="$ROOT"
+            elif [[ -f "$ROOT/package.json" ]] && grep -q '"build"' "$ROOT/package.json"; then
+              (cd "$ROOT" && npm run build) || true
+              for d in dist build out public; do
+                if [[ -f "$ROOT/$d/index.html" ]]; then WEBROOT="$ROOT/$d"; break; fi
+              done
+            fi
+
+            if [[ -z "$WEBROOT" ]]; then
+              ANY=$(find "$ROOT" -maxdepth 4 \( -name '*.html' -o -name '*.htm' \) \
+                -not -path '*/node_modules/*' -not -path '*/.git/*' -print 2>/dev/null | head -1 || true)
+              if [[ -n "$ANY" ]]; then WEBROOT="$ROOT"; fi
+            fi
+
+            if [[ -z "$WEBROOT" ]]; then
+              echo "::error::Nothing to capture in '$PROJECT_PATH': no Xcode project, Flutter/React Native iOS folder, or HTML pages were found. Check the project path."
+              exit 1
+            fi
+
+            echo "mode=web" >> "$GITHUB_OUTPUT"
+            echo "web_root=$WEBROOT" >> "$GITHUB_OUTPUT"
+            echo "Web project detected at $WEBROOT"
+            exit 0
+          fi
+
+          IOS_DIR="$(dirname "$APP_PROJECT")"
+          echo "Detected project: $APP_PROJECT"
+
+          # The user's project is never edited: Xcode 16 projects use
+          # synchronized groups that the xcodeproj gem cannot parse.
+          # Instead a separate tiny runner project is generated, and it
+          # drives the installed app through its bundle identifier.
+          sudo gem install xcodeproj
+
+          KIND="project"
+          CONTAINER="$APP_PROJECT"
+
+          if [[ -f "$IOS_DIR/Podfile" ]]; then
+            command -v pod >/dev/null 2>&1 || sudo gem install cocoapods
+            pod install --project-directory="$IOS_DIR"
+          fi
+
+          WS=$(find "$IOS_DIR" -maxdepth 1 -name '*.xcworkspace' -print -quit 2>/dev/null || true)
+          if [[ -n "$WS" ]]; then
+            KIND="workspace"
+            CONTAINER="$WS"
+          fi
+
+          # ----- choose the scheme -----
+          LIST=$(xcodebuild -list -json "-$KIND" "$CONTAINER")
+          SCHEMES=$(echo "$LIST" | jq -r '(.workspace.schemes // .project.schemes // [])[]')
+          echo "Schemes: $(echo "$SCHEMES" | tr '\n' ' ')"
+
+          SCHEME=""
+          REQUESTED="$(echo "$APP_TARGET" | xargs || true)"
+          if [[ -n "$REQUESTED" ]] && grep -Fxq "$REQUESTED" <<<"$SCHEMES"; then
+            SCHEME="$REQUESTED"
+          fi
+          if [[ -z "$SCHEME" ]]; then
+            SCHEME=$(grep -v '^Pods' <<<"$SCHEMES" | head -1 || true)
+          fi
+          if [[ -z "$SCHEME" ]]; then
+            echo "::error::No Xcode scheme found in $CONTAINER"
+            exit 1
+          fi
+          echo "Using scheme: $SCHEME"
+
+          # ----- build the app for the simulator (arm64 only) -----
+          APP_DERIVED="$RUNNER_TEMP/AppBuild"
+
+          xcodebuild build \
+            "-$KIND" "$CONTAINER" \
+            -scheme "$SCHEME" \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "platform=iOS Simulator,id=$DEVICE_ID,arch=arm64" \
+            -derivedDataPath "$APP_DERIVED" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            EXCLUDED_ARCHS=x86_64 \
+            CODE_SIGNING_ALLOWED=NO \
+            > "$GITHUB_WORKSPACE/build.log" 2>&1 || {
+              echo "xcodebuild failed. Errors:"
+              grep -E "error:" "$GITHUB_WORKSPACE/build.log" | tail -30 || true
+              echo "error: app build failed for scheme $SCHEME"
+              exit 1
+            }
+
+          APP=$(find "$APP_DERIVED/Build/Products" -maxdepth 2 -type d -name '*.app' \
+            -path '*iphonesimulator*' -print 2>/dev/null | head -1 || true)
+
+          if [[ -z "$APP" ]]; then
+            echo "error: app bundle not found after build (scheme $SCHEME is not an iOS app?)"
+            exit 1
+          fi
+
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+          echo "Built $APP ($BUNDLE_ID)"
+
+          xcrun simctl install "$DEVICE_ID" "$APP"
+
+          # ----- generate the separate runner project -----
+          RUNNER_DIR="$RUNNER_TEMP/PreviewRunner"
+          rm -rf "$RUNNER_DIR"
+          mkdir -p "$RUNNER_DIR/PreviewHost" "$RUNNER_DIR/PreviewUITests"
+
+          cp "$SUPPORT/HostApp.swift" "$RUNNER_DIR/PreviewHost/HostApp.swift"
+
+          cp "$SUPPORT/ScreenshotTests.swift" "$RUNNER_DIR/PreviewUITests/ScreenshotTests.swift"
+
+          sed -i '' "s/__TARGET_BUNDLE_ID__/$BUNDLE_ID/g" \
+            "$RUNNER_DIR/PreviewUITests/ScreenshotTests.swift"
+
+          export RUNNER_DIR
+
+          ruby "$SUPPORT/make_runner.rb"
+
+          echo "mode=xcode" >> "$GITHUB_OUTPUT"
+          echo "runner_project=$RUNNER_DIR/PreviewRunner.xcodeproj" >> "$GITHUB_OUTPUT"
+          echo "bundle_id=$BUNDLE_ID" >> "$GITHUB_OUTPUT"
+
+      # ---------- capture: native app ----------
+
+      - name: Run UI tests and capture screenshots
+        id: tests
+        if: steps.prep.outputs.mode == 'xcode'
+        continue-on-error: true
+        shell: bash
+        env:
+          DEVICE_ID: ${{ steps.boot.outputs.device_id }}
+          RUNNER_PROJECT: ${{ steps.prep.outputs.runner_project }}
+        run: |
+          set -uo pipefail
+
+          RESULT_BUNDLE="$RUNNER_TEMP/Preview.xcresult"
+          DERIVED="$RUNNER_TEMP/SimulatorBuild"
+
+          rm -rf "$RESULT_BUNDLE" /tmp/PreviewScreenshots
+
+          xcodebuild test \
+            -project "$RUNNER_PROJECT" \
+            -scheme PreviewUI \
+            -destination "platform=iOS Simulator,id=$DEVICE_ID,arch=arm64" \
+            -derivedDataPath "$DERIVED" \
+            -resultBundlePath "$RESULT_BUNDLE" \
+            -parallel-testing-enabled NO \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            EXCLUDED_ARCHS=x86_64 \
+            CODE_SIGNING_ALLOWED=NO \
+            > "$GITHUB_WORKSPACE/test.log" 2>&1
+
+          CODE=$?
+
+          echo "UI_TEST_EXIT_CODE=$CODE"
+
+          grep -E "error:|SCREENSHOT_SAVED:|TOTAL_SCREENSHOTS:|Test Case.*(passed|failed)|TEST (SUCCEEDED|FAILED)" \
+            "$GITHUB_WORKSPACE/test.log" | tail -120 || true
+
+          exit "$CODE"
+
+      - name: Collect screenshots
+        if: always() && steps.prep.outputs.mode == 'xcode'
+        shell: bash
+        env:
+          DEVICE_ID: ${{ steps.boot.outputs.device_id }}
+        run: |
+          set -uo pipefail
+
+          OUT="$GITHUB_WORKSPACE/Screenshots"
+          DERIVED="$RUNNER_TEMP/SimulatorBuild"
+          RESULT_BUNDLE="$RUNNER_TEMP/Preview.xcresult"
+          EXPORT="$RUNNER_TEMP/ExportedScreenshots"
+
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          has_images() { compgen -G "$OUT/*.png" > /dev/null; }
+
+          # 1) Folder written directly by the test on the macOS host
+          if [[ -d /tmp/PreviewScreenshots ]]; then
+            cp /tmp/PreviewScreenshots/*.png "$OUT/" 2>/dev/null || true
+            cp /tmp/PreviewScreenshots/index.txt "$OUT/" 2>/dev/null || true
+          fi
+
+          # 2) Documents folder inside the XCTest runner container
+          if ! has_images && [[ -d "$DERIVED/Build/Products" ]]; then
+            while IFS= read -r RUNNER_APP; do
+              RUNNER_ID=$(/usr/libexec/PlistBuddy \
+                -c 'Print :CFBundleIdentifier' \
+                "$RUNNER_APP/Info.plist" 2>/dev/null || true)
+              [[ -n "$RUNNER_ID" ]] || continue
+
+              CONTAINER_DIR=$(xcrun simctl get_app_container \
+                "$DEVICE_ID" "$RUNNER_ID" data 2>/dev/null || true)
+              SOURCE="$CONTAINER_DIR/Documents/PreviewScreenshots"
+
+              if [[ -d "$SOURCE" ]]; then
+                cp "$SOURCE/"*.png "$OUT/" 2>/dev/null || true
+                cp "$SOURCE/index.txt" "$OUT/" 2>/dev/null || true
+              fi
+            done < <(find "$DERIVED/Build/Products" -type d -name '*-Runner.app' -print)
+          fi
+
+          # 3) Attachments stored in the .xcresult bundle
+          if ! has_images && [[ -d "$RESULT_BUNDLE" ]]; then
+            mkdir -p "$EXPORT"
+            xcrun xcresulttool export attachments \
+              --path "$RESULT_BUNDLE" \
+              --output-path "$EXPORT" || true
+
+            python3 - "$EXPORT" "$OUT" <<'PY'
+          import json, os, re, shutil, sys
+
+          export, out = sys.argv[1], sys.argv[2]
+          manifest = os.path.join(export, "manifest.json")
+          count = 0
+
+          if os.path.exists(manifest):
+              with open(manifest, encoding="utf-8") as f:
+                  entries = json.load(f)
+              for entry in entries:
+                  for att in entry.get("attachments", []):
+                      src = os.path.join(export, att.get("exportedFileName", ""))
+                      if not src.lower().endswith(".png") or not os.path.exists(src):
+                          continue
+                      name = att.get("suggestedHumanReadableName", "")
+                      name = re.sub(r"_\d+_[0-9A-Fa-f-]{36}.*$", "", name)
+                      name = re.sub(r"[^A-Za-z0-9_-]", "-", name) or f"shot-{count + 1}"
+                      shutil.copy(src, os.path.join(out, name + ".png"))
+                      count += 1
+
+          print(f"Recovered {count} screenshots from xcresult")
+          PY
+          fi
+
+          echo "Collected screenshots:"
+          find "$OUT" -maxdepth 1 -name '*.png' | sort
+
+      - name: Fallback launch screenshots
+        if: always() && steps.prep.outputs.mode == 'xcode'
+        continue-on-error: true
+        shell: bash
+        env:
+          DEVICE_ID: ${{ steps.boot.outputs.device_id }}
+          BUNDLE_ID: ${{ steps.prep.outputs.bundle_id }}
+        run: |
+          set -uo pipefail
+
+          OUT="$GITHUB_WORKSPACE/Screenshots"
+          mkdir -p "$OUT"
+
+          if compgen -G "$OUT/*.png" > /dev/null; then
+            echo "Screenshots already exist. Skipping fallback."
+            exit 0
+          fi
+
+          xcrun simctl terminate "$DEVICE_ID" "$BUNDLE_ID" 2>/dev/null || true
+          xcrun simctl launch "$DEVICE_ID" "$BUNDLE_ID"
+          sleep 10
+          xcrun simctl io "$DEVICE_ID" screenshot "$OUT/00-launch.png"
+
+          echo "00-launch|شاشة البداية" > "$OUT/index.txt"
+
+      # ---------- capture: web project ----------
+
+      - name: Capture web pages in an iPhone viewport
+        if: steps.prep.outputs.mode == 'web'
+        shell: bash
+        env:
+          WEB_ROOT: ${{ steps.prep.outputs.web_root }}
+        run: |
+          set -euo pipefail
+
+          SUPPORT="$GITHUB_WORKSPACE/.github/screenshot-preview"
+          OUT="$GITHUB_WORKSPACE/Screenshots"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          PW="$RUNNER_TEMP/pw"
+          mkdir -p "$PW"
+          cd "$PW"
+          npm init -y >/dev/null
+          npm install playwright
+          npx playwright install chromium
+
+          cp "$SUPPORT/capture_web.cjs" shot.cjs
+
+          python3 -m http.server 8123 --bind 127.0.0.1 --directory "$WEB_ROOT" >/dev/null 2>&1 &
+          SERVER=$!
+          sleep 2
+
+          node shot.cjs "$WEB_ROOT" "$OUT" "http://127.0.0.1:8123" || true
+
+          kill "$SERVER" 2>/dev/null || true
+
+      # ---------- publish ----------
+
+      - name: Verify screenshots
+        id: verify
+        if: always()
+        shell: bash
+        env:
+          MODE: ${{ steps.prep.outputs.mode }}
+        run: |
+          set -euo pipefail
+
+          OUT="$GITHUB_WORKSPACE/Screenshots"
+          mkdir -p "$OUT"
+
+          COUNT=$(find "$OUT" -maxdepth 1 -type f -name '*.png' | wc -l | tr -d ' ')
+
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Total PNG screenshots: $COUNT (mode: ${MODE:-none})"
+
+          {
+            echo "### iPhone Simulator Preview"
+            echo "- Mode: ${MODE:-none}"
+            echo "- Screenshots: $COUNT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$COUNT" -eq 0 ]]; then
+            if [[ "${MODE:-none}" == "none" ]]; then
+              echo "---- Why the project could not be prepared (last lines of prep.log) ----"
+              tail -n 40 "$GITHUB_WORKSPACE/prep.log" 2>/dev/null || echo "prep.log missing"
+              REASON=$(grep -E "error|Error|Nothing to capture|not found" "$GITHUB_WORKSPACE/prep.log" 2>/dev/null | tail -n 3 | tr '\n' ' ' || true)
+              echo "::error::Project preparation failed: ${REASON:-see prep.log in the artifact}"
+              echo "- Reason: ${REASON:-unknown}" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::No screenshots were captured. See test.log / fallback-build.log in the artifact."
+            fi
+            exit 1
+          fi
+
+      - name: Shrink images and build gallery
+        if: always() && steps.verify.outputs.count != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE/Screenshots"
+
+          for file in *.png; do
+            [[ -f "$file" ]] || continue
+            sips --resampleWidth 600 "$file" >/dev/null || true
+          done
+
+          python3 - <<'PY'
+          import glob
+          import os
+
+          titles = {}
+
+          if os.path.exists("index.txt"):
+              with open("index.txt", encoding="utf-8") as f:
+                  for line in f:
+                      line = line.rstrip("\n")
+                      if "|" in line:
+                          key, value = line.split("|", 1)
+                          titles[key] = value
+
+          names = sorted(os.path.splitext(p)[0] for p in glob.glob("*.png"))
+
+          with open("index.txt", "w", encoding="utf-8") as f:
+              for name in names:
+                  f.write(f"{name}|{titles.get(name, name)}\n")
+
+          lines = [
+              "# لقطات التطبيق",
+              "",
+              "صور حقيقية تم التقاطها تلقائيا.",
+              "",
+          ]
+
+          for name in names:
+              lines += [
+                  "## " + titles.get(name, name),
+                  "",
+                  f'<img src="{name}.png" width="260">',
+                  "",
+              ]
+
+          with open("README.md", "w", encoding="utf-8") as f:
+              f.write("\n".join(lines))
+
+          print(f"Gallery created: {len(names)} images")
+          PY
+
+      - name: Save screenshots inside the repository
+        if: always() && steps.verify.outputs.count != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A -f Screenshots
+
+          if git diff --cached --quiet; then
+            echo "No screenshot changes"
+            exit 0
+          fi
+
+          git commit -m "Update app screenshots"
+
+          git pull --rebase --autostash origin "$GITHUB_REF_NAME" || true
+          git push origin "HEAD:$GITHUB_REF_NAME"
+
+      - name: Upload logs and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iPhone-Simulator-Preview-${{ github.run_number }}
+          path: |
+            Screenshots/
+            test.log
+            fallback-build.log
+            prep.log
+            build.log
+            ${{ runner.temp }}/Preview.xcresult/
+          if-no-files-found: warn
+          retention-days: 7

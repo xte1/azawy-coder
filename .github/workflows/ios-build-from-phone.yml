@@ -1,0 +1,170 @@
+name: Build iOS IPA from Builder Mobile
+run-name: iOS IPA ${{ inputs.build_id || github.run_number }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: Unique build label
+        required: true
+        type: string
+      project_path:
+        description: Project root relative to the repository
+        required: true
+        default: .
+        type: string
+      scheme:
+        description: Xcode scheme (leave empty for automatic detection)
+        required: false
+        default: ''
+        type: string
+      configuration:
+        description: Xcode build configuration
+        required: true
+        default: Release
+        type: choice
+        options:
+          - Release
+          - Debug
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js when needed
+        if: hashFiles(format('{0}/package.json', inputs.project_path)) != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install JavaScript dependencies
+        if: hashFiles(format('{0}/package.json', inputs.project_path)) != ''
+        working-directory: ${{ inputs.project_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable || true
+          if [[ -f pnpm-lock.yaml ]]; then
+            corepack prepare pnpm@latest --activate
+            pnpm install --frozen-lockfile
+          elif [[ -f yarn.lock ]]; then
+            yarn install --frozen-lockfile
+          elif [[ -f package-lock.json ]]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Set up Flutter when needed
+        if: hashFiles(format('{0}/pubspec.yaml', inputs.project_path)) != ''
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Build Flutter app
+        if: hashFiles(format('{0}/pubspec.yaml', inputs.project_path)) != ''
+        working-directory: ${{ inputs.project_path }}
+        run: |
+          flutter pub get
+          flutter build ios --release --no-codesign
+
+      - name: Generate iOS project for managed Expo
+        if: hashFiles(format('{0}/package.json', inputs.project_path)) != '' && hashFiles(format('{0}/ios/*.xcodeproj/project.pbxproj', inputs.project_path)) == '' && hashFiles(format('{0}/pubspec.yaml', inputs.project_path)) == ''
+        working-directory: ${{ inputs.project_path }}
+        shell: bash
+        run: |
+          if grep -q '"expo"' package.json; then
+            npx expo prebuild --platform ios --no-install
+          fi
+
+      - name: Install CocoaPods dependencies
+        if: hashFiles(format('{0}/ios/Podfile', inputs.project_path)) != ''
+        run: pod install --project-directory="${{ inputs.project_path }}/ios"
+
+      - name: Build Xcode project
+        if: hashFiles(format('{0}/pubspec.yaml', inputs.project_path)) == ''
+        shell: bash
+        env:
+          PROJECT_PATH: ${{ inputs.project_path }}
+          REQUESTED_SCHEME: ${{ inputs.scheme }}
+          CONFIGURATION: ${{ inputs.configuration }}
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/$PROJECT_PATH"
+          IOS_DIR="$ROOT"
+          if [[ -d "$ROOT/ios" ]]; then IOS_DIR="$ROOT/ios"; fi
+          if [[ -d "$ROOT/iosApp" && "$PROJECT_PATH" == "." ]]; then IOS_DIR="$ROOT/iosApp"; fi
+
+          WORKSPACE=$(find "$IOS_DIR" -maxdepth 2 -name '*.xcworkspace' -print -quit)
+          PROJECT=$(find "$IOS_DIR" -maxdepth 2 -name '*.xcodeproj' -print -quit)
+          if [[ -z "$WORKSPACE" && -z "$PROJECT" ]]; then
+            echo "No .xcworkspace or .xcodeproj found under $IOS_DIR" >&2
+            exit 1
+          fi
+
+          TARGET=""
+          if [[ -n "$REQUESTED_SCHEME" ]]; then
+            TARGET="$REQUESTED_SCHEME"
+          else
+            if [[ -n "$WORKSPACE" ]]; then
+              LIST=$(xcodebuild -list -json -workspace "$WORKSPACE")
+            else
+              LIST=$(xcodebuild -list -json -project "$PROJECT")
+            fi
+            TARGET=$(echo "$LIST" | jq -r '.workspace.schemes[0] // .project.schemes[0] // empty')
+          fi
+          if [[ -z "$TARGET" ]]; then
+            echo "Could not detect an Xcode scheme. Enter the scheme in Builder Mobile." >&2
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/ipa-output"
+          if [[ -n "$WORKSPACE" ]]; then
+            xcodebuild -workspace "$WORKSPACE" -scheme "$TARGET" -configuration "$CONFIGURATION" -sdk iphoneos -derivedDataPath "$RUNNER_TEMP/DerivedData" CODE_SIGNING_ALLOWED=NO build
+          else
+            xcodebuild -project "$PROJECT" -scheme "$TARGET" -configuration "$CONFIGURATION" -sdk iphoneos -derivedDataPath "$RUNNER_TEMP/DerivedData" CODE_SIGNING_ALLOWED=NO build
+          fi
+
+      - name: Package IPA
+        shell: bash
+        env:
+          PROJECT_PATH: ${{ inputs.project_path }}
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/$PROJECT_PATH"
+          APP=""
+          if [[ -d "$ROOT/build/ios/iphoneos" ]]; then
+            APP=$(find "$ROOT/build/ios/iphoneos" -maxdepth 1 -type d -name '*.app' -print -quit)
+          fi
+          if [[ -z "$APP" ]]; then
+            APP=$(find "$RUNNER_TEMP/DerivedData/Build/Products" -type d -path '*/Release-iphoneos/*.app' -print -quit 2>/dev/null || true)
+          fi
+          if [[ -z "$APP" ]]; then
+            APP=$(find "$RUNNER_TEMP/DerivedData/Build/Products" -type d -path '*/Debug-iphoneos/*.app' -print -quit 2>/dev/null || true)
+          fi
+          if [[ -z "$APP" ]]; then
+            echo "No built .app was found. Check the build logs and project path." >&2
+            exit 1
+          fi
+          STAGE="$RUNNER_TEMP/ipa-stage"
+          mkdir -p "$STAGE/Payload" "$GITHUB_WORKSPACE/ipa-output"
+          cp -R "$APP" "$STAGE/Payload/"
+          NAME=$(echo "$BUILD_ID" | tr -cd 'A-Za-z0-9._-')
+          (cd "$STAGE" && /usr/bin/zip -qry "$GITHUB_WORKSPACE/ipa-output/$NAME.ipa" Payload)
+          ls -lh "$GITHUB_WORKSPACE/ipa-output/$NAME.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa-${{ inputs.build_id }}
+          path: ipa-output/*.ipa
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,4 @@
+01-launch|شاشة البداية
+02-main-scroll|الشاشة الرئيسية بعد التمرير
+03-main-a1|الشاشة الرئيسية › اتصال بـ GitHub
+04-main-a1-b2|الشاشة الرئيسية › اتصال بـ GitHub › إدارة Fine-grained tokens
